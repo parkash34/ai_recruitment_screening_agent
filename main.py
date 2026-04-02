@@ -1,13 +1,10 @@
 import os
-import re
 import requests
 import json
 import logging
-import random
 from pydantic import BaseModel, validator
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from datetime import datetime
 
 
 logging.basicConfig(
@@ -310,7 +307,7 @@ def check_output_guardrail(response):
     forbidden = ["age", "gender", "religion", "ethnicity", "race", "nationality"]
     for word in forbidden:
         if word in text:
-            return False, "Racist Detected"
+            return False, "Response contains discriminatory content"
     if not text.strip():
         return False, "Empty response"
     return True, None
@@ -421,3 +418,166 @@ def generate_report(job_title):
     return report
 
 
+@app.post("/setup-job")
+def setup_job(job: JobRequirement):
+    session_id = job.session_id
+    session_id_checker(session_id)
+
+    sessions[session_id]["job"] = {
+        "job_title": job.job_title,
+        "required_skills": job.required_skills,
+        "experience_years": job.experience_years,
+        "nice_to_have": job.nice_to_have,
+        "location": job.location,
+        "language": job.language
+    }
+
+    return {
+        "status": "success",
+        "message": f"Job '{job.job_title}' has been set up successfully.",
+        "session_id": session_id
+    }
+
+
+@app.post("/add-applicant")
+def add_applicant(applicant: Applicant):
+    session_id = applicant.session_id
+    session_id_checker(session_id)
+
+    if sessions[session_id]["job"] is None:
+        return create_error_response(
+            code="JOB_NOT_SETUP",
+            message="Please set up a job first before adding applicants.",
+            details="Call POST /setup-job first."
+        )
+
+    applicant_data = applicant.dict()
+    applicant_data.pop("session_id")
+
+    sessions[session_id]["applicants"].append(applicant_data)
+    count = len(sessions[session_id]["applicants"])
+
+    return {
+        "status": "success",
+        "message": f"Applicant '{applicant.name}' added successfully.",
+        "total_applicants": count
+    }
+
+
+@app.post("/screen")
+def screen(request: ScreenRequest):
+    global current_session
+    session_id = request.session_id
+
+    if session_id not in sessions:
+        return create_error_response(
+            code="SESSION_NOT_FOUND",
+            message="Session not found.",
+            details="Please set up a job first."
+        )
+    if sessions[session_id]["job"] is None:
+        return create_error_response(
+            code="JOB_NOT_SETUP",
+            message="No job found for this session.",
+            details="Call POST /setup-job first."
+        )
+    if len(sessions[session_id]["applicants"]) < 2:
+        return create_error_response(
+            code="NOT_ENOUGH_APPLICANTS",
+            message="At least 2 applicants are required before screening.",
+            details=f"Current applicants: {len(sessions[session_id]['applicants'])}"
+        )
+
+    current_session = session_id
+    job = sessions[session_id]["job"]
+    applicants = sessions[session_id]["applicants"]
+
+    sessions[session_id]["analyzed"] = []
+    sessions[session_id]["results"] = None
+
+    screen_prompt = f"""
+    You are screening applicants for the position of {job['job_title']}.
+
+    Please do the following steps in order:
+    1. Analyze each applicant one by one using analyze_applicant()
+    2. After analyzing all applicants get top 3 using get_top_candidates()
+    3. Generate final report using generate_report()
+
+    Applicants to analyze: {[a['name'] for a in applicants]}
+
+    Start analyzing now.
+    """
+
+    messages = [
+        {"role": "system", "content": system_prompt(job=job, applicants=applicants)},
+        {"role": "user", "content": screen_prompt}
+    ]
+
+    try:
+        while True:
+            response = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "temperature": 0.1,
+                    "max_tokens": 1000,
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice": "auto"
+                },
+                timeout=30
+            )
+            response.raise_for_status()
+            message = response.json()["choices"][0]["message"]
+
+            if not message.get("tool_calls"):
+                break
+
+            tool_call = message["tool_calls"][0]
+            function_name = tool_call["function"]["name"]
+            arguments = json.loads(tool_call["function"]["arguments"])
+
+            if function_name == "analyze_applicant":
+                result = analyze_applicant(**arguments)
+            elif function_name == "get_top_candidates":
+                result = get_top_candidates()
+            elif function_name == "generate_report":
+                result = generate_report(**arguments)
+            else:
+                result = "Function not found"
+
+            messages.append(message)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "content": str(result)
+            })
+
+        return {
+            "status": "success",
+            "report": message["content"]
+        }
+
+    except requests.exceptions.Timeout:
+        logger.error("Screening timeout")
+        return create_error_response(
+            code="TIMEOUT",
+            message="Screening timed out.",
+            details="Please try again."
+        )
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP Error: {e.response.status_code}")
+        return create_error_response(
+            code="API_ERROR",
+            message="AI service error.",
+            details=f"Status: {e.response.status_code}"
+        )
+    except Exception as e:
+        logger.error(f"Screening error: {str(e)}")
+        return create_error_response(
+            code="UNKNOWN_ERROR",
+            message="Something went wrong during screening.",
+            details=str(e)
+        )
+    
