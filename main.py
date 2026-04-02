@@ -22,7 +22,8 @@ if not api_key:
     raise ValueError("API Key is missing in .env file")
 
 app = FastAPI()
-memory = {}
+sessions = {}
+current_session = None
 
 class JobRequirement(BaseModel):
     session_id : str
@@ -59,7 +60,7 @@ class Applicant(BaseModel):
     education : str
     previous_roles : list
     location : str
-    language : str
+    languages: list
 
     @validator("session_id")
     def session_id_not_empty(cls, v):
@@ -79,7 +80,7 @@ class Applicant(BaseModel):
             raise ValueError("Applicant name cannot be empty")
         return v
 
-class ScreenRequest:
+class ScreenRequest(BaseModel):
     session_id : str
 
     @validator("session_id")
@@ -88,19 +89,95 @@ class ScreenRequest:
             raise ValueError("Session ID is missing")
         return v
     
-def session_id_checker(session_id):
-    if session_id not in memory:
-        memory[session_id] = []
 
-def create_error_response(code, message, details=None):
-    return {
-        "status" : "error",
-        "code" : code,
-        "message" : message,
-        "details" : details
-    }
+def system_prompt(job=None, applicants=None):
+    job_info = ""
+    applicants_info = ""
 
-forbidden = ["age", "gender", "religion", "ethnicity", "race", "nationality"]
+    if job:
+        job_info = f"""
+    JOB REQUIREMENTS:
+    - Job Title: {job["job_title"]}
+    - Required Skills: {", ".join(job["required_skills"])}
+    - Experience Required: {job["experience_years"]} years
+    - Nice to Have: {", ".join(job["nice_to_have"])}
+    - Location: {job["location"]}
+    - Language: {job["language"]}
+    """
+
+    if applicants:
+        applicants_info = "APPLICANT PROFILES:\n"
+        for i, a in enumerate(applicants, 1):
+            applicants_info += f"""
+    Applicant {i}: {a["name"]}
+    - Experience: {a["experience_years"]} years
+    - Skills: {", ".join(a["skills"])}
+    - Education: {a["education"]}
+    - Previous Roles: {", ".join(a["previous_roles"])}
+    - Location: {a["location"]}
+    - Languages: {", ".join(a["languages"])}
+    """
+
+    return f"""
+    You are an expert recruitment analyst for TalentAI.
+    Your goal is to fairly and accurately screen applicants
+    based on job requirements.
+
+    {job_info}
+
+    {applicants_info}
+
+    SCORING RULES:
+    Score each applicant out of 100 using these categories:
+
+    1. Required Skills Match — 40 points
+       - Full match: 40 points
+       - Partial match: proportional points
+       - No match: 0 points
+
+    2. Experience Match — 30 points
+       - Meets or exceeds requirement: 30 points
+       - One year short: 20 points
+       - Two years short: 10 points
+       - Three or more years short: 0 points
+
+    3. Location Match — 10 points
+       - Same location: 10 points
+       - Different location: 0 points
+
+    4. Nice to Have Skills — 20 points
+       - Each nice to have skill matched: proportional points
+
+    ANTI-HALLUCINATION RULES:
+    - Only evaluate based on the applicant data provided above
+    - Never assume skills or experience not listed
+    - Never make up qualifications
+    - If information is missing mark it as unknown
+    - Only use the job requirements provided above
+
+    ANTI-DISCRIMINATION RULES:
+    - Never comment on age, gender, religion, ethnicity or nationality
+    - Only evaluate professional qualifications and skills
+    - Be fair and objective in all evaluations
+    - Base recommendations only on job relevant criteria
+
+    Always respond in this exact JSON format:
+    {{
+        "applicant_name": "name here",
+        "total_score": 0,
+        "score_breakdown": {{
+            "required_skills": 0,
+            "experience": 0,
+            "location": 0,
+            "nice_to_have": 0
+        }},
+        "strengths": ["strength 1", "strength 2"],
+        "weaknesses": ["weakness 1", "weakness 2"],
+        "recommendation": "your recommendation here"
+    }}
+
+    Do not add any text outside the JSON.
+    """
 
 applicants_database = [
     {
@@ -208,92 +285,139 @@ tools = [
     }
 ]
 
-def system_prompt(job=None, applicants=None):
-    job_info = ""
-    applicants_info = ""
+def session_id_checker(session_id):
+    if session_id not in sessions:
+        sessions[session_id] = {
+            "job": None,
+            "applicants": [],
+            "analyzed" : [],
+            "results" : None
+        }
 
-    if job:
-        job_info = f"""
-    JOB REQUIREMENTS:
-    - Job Title: {job["job_title"]}
-    - Required Skills: {", ".join(job["required_skills"])}
-    - Experience Required: {job["experience_years"]} years
-    - Nice to Have: {", ".join(job["nice_to_have"])}
-    - Location: {job["location"]}
-    - Language: {job["language"]}
-    """
+def create_error_response(code, message, details=None):
+    return {
+        "status" : "error",
+        "code" : code,
+        "message" : message,
+        "details" : details
+    }
+def check_output_guardrail(response):
+    text = " ".join([
+        response.get("recommendation", ""),
+        " ".join(response.get("strengths", [])),
+        " ".join(response.get("weaknesses", []))
+    ]).lower()
+    forbidden = ["age", "gender", "religion", "ethnicity", "race", "nationality"]
+    for word in forbidden:
+        if word in text:
+            return False, "Racist Detected"
+    if not text.strip():
+        return False, "Empty response"
+    return True, None
 
-    if applicants:
-        applicants_info = "APPLICANT PROFILES:\n"
-        for i, a in enumerate(applicants, 1):
-            applicants_info += f"""
-    Applicant {i}: {a["name"]}
-    - Experience: {a["experience_years"]} years
-    - Skills: {", ".join(a["skills"])}
-    - Education: {a["education"]}
-    - Previous Roles: {", ".join(a["previous_roles"])}
-    - Location: {a["location"]}
-    - Languages: {", ".join(a["languages"])}
-    """
 
-    return f"""
-    You are an expert recruitment analyst for TalentAI.
-    Your goal is to fairly and accurately screen applicants
-    based on job requirements.
+def analyze_applicant(applicant_name):
+    global current_session
+    session = sessions[current_session]
+    job = session["job"]
 
-    {job_info}
+    applicant = None
+    for a in session["applicants"]:
+        if a["name"].lower() == applicant_name.lower():
+            applicant = a
+            break
 
-    {applicants_info}
+    if not applicant:
+        return f"Applicant {applicant_name} not found."
 
-    SCORING RULES:
-    Score each applicant out of 100 using these categories:
+    try:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "temperature": 0.1,
+                "max_tokens": 500,
+                "messages": [
+                    {"role": "system", "content": system_prompt(job=job)},
+                    {"role": "user", "content": f"Analyze and score this applicant: {json.dumps(applicant)}"}
+                ]
+            },
+            timeout=15
+        )
+        response.raise_for_status()
+        raw = response.json()["choices"][0]["message"]["content"]
+        result = json.loads(raw)
 
-    1. Required Skills Match — 40 points
-       - Full match: 40 points
-       - Partial match: proportional points
-       - No match: 0 points
+        is_valid, error = check_output_guardrail(result)
+        if not is_valid:
+            logger.warning(f"Guardrail triggered for {applicant_name}: {error}")
+            return f"Analysis blocked for {applicant_name} due to security check."
 
-    2. Experience Match — 30 points
-       - Meets or exceeds requirement: 30 points
-       - One year short: 20 points
-       - Two years short: 10 points
-       - Three or more years short: 0 points
+        session["analyzed"] = session.get("analyzed", [])
+        session["analyzed"].append(result)
 
-    3. Location Match — 10 points
-       - Same location: 10 points
-       - Different location: 0 points
+        return json.dumps(result)
 
-    4. Nice to Have Skills — 20 points
-       - Each nice to have skill matched: proportional points
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout analyzing {applicant_name}")
+        return f"Timeout analyzing {applicant_name}"
+    except json.JSONDecodeError:
+        logger.error(f"Invalid JSON for {applicant_name}")
+        return f"Invalid response for {applicant_name}"
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+        return f"Error analyzing {applicant_name}: {str(e)}"
+    
 
-    ANTI-HALLUCINATION RULES:
-    - Only evaluate based on the applicant data provided above
-    - Never assume skills or experience not listed
-    - Never make up qualifications
-    - If information is missing mark it as unknown
-    - Only use the job requirements provided above
+def get_top_candidates():
+    global current_session
+    session = sessions[current_session]
+    analyzed = session.get("analyzed", [])
 
-    ANTI-DISCRIMINATION RULES:
-    - Never comment on age, gender, religion, ethnicity or nationality
-    - Only evaluate professional qualifications and skills
-    - Be fair and objective in all evaluations
-    - Base recommendations only on job relevant criteria
+    if not analyzed:
+        return "No applicants have been analyzed yet."
 
-    Always respond in this exact JSON format:
-    {{
-        "applicant_name": "name here",
-        "total_score": 0,
-        "score_breakdown": {{
-            "required_skills": 0,
-            "experience": 0,
-            "location": 0,
-            "nice_to_have": 0
-        }},
-        "strengths": ["strength 1", "strength 2"],
-        "weaknesses": ["weakness 1", "weakness 2"],
-        "recommendation": "your recommendation here"
-    }}
+    ranked = sorted(analyzed, key=lambda x: x["total_score"], reverse=True)
 
-    Do not add any text outside the JSON.
-    """
+    top3 = ranked[:3]
+    session["results"] = top3
+
+    return json.dumps(top3)
+
+def generate_report(job_title):
+    global current_session
+    session = sessions[current_session]
+    top_applicants = session.get("results", [])
+
+    if not top_applicants:
+        return "No ranked candidates found. Please run screening first."
+
+    report = f"RECRUITMENT REPORT — {job_title}\n"
+    report += "=" * 50 + "\n\n"
+
+    for i, applicant in enumerate(top_applicants, 1):
+        report += f"RANK {i}: {applicant['applicant_name']}\n"
+        report += f"Total Score: {applicant['total_score']}/100\n\n"
+
+        report += "Score Breakdown:\n"
+        breakdown = applicant["score_breakdown"]
+        report += f"  Required Skills : {breakdown['required_skills']}/40\n"
+        report += f"  Experience      : {breakdown['experience']}/30\n"
+        report += f"  Location        : {breakdown['location']}/10\n"
+        report += f"  Nice to Have    : {breakdown['nice_to_have']}/20\n\n"
+
+        report += "Strengths:\n"
+        for s in applicant["strengths"]:
+            report += f"  + {s}\n"
+
+        report += "\nWeaknesses:\n"
+        for w in applicant["weaknesses"]:
+            report += f"  - {w}\n"
+
+        report += f"\nRecommendation: {applicant['recommendation']}\n"
+        report += "-" * 50 + "\n\n"
+
+    return report
+
 
