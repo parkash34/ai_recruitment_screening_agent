@@ -87,6 +87,20 @@ class ScreenRequest:
         if not v.strip():
             raise ValueError("Session ID is missing")
         return v
+    
+def session_id_checker(session_id):
+    if session_id not in memory:
+        memory[session_id] = []
+
+def create_error_response(code, message, details=None):
+    return {
+        "status" : "error",
+        "code" : code,
+        "message" : message,
+        "details" : details
+    }
+
+forbidden = ["age", "gender", "religion", "ethnicity", "race", "nationality"]
 
 applicants_database = [
     {
@@ -282,5 +296,4 @@ def system_prompt(job=None, applicants=None):
 
     Do not add any text outside the JSON.
     """
-
 
