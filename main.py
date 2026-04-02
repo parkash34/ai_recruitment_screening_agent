@@ -33,6 +33,24 @@ class JobRequirement(BaseModel):
     location : str
     language : str
 
+    @validator("session_id")
+    def session_id_not_empty(cls, v):
+        if not v.strip():
+            raise ValueError("Session ID is missing")
+        return v
+    
+    @validator("job_title")
+    def job_title_not_empty(cls, v):
+        if not v.strip():
+            raise ValueError("Job title cannot be empty")
+        return v
+    
+    @validator("required_skills")
+    def skills_not_empty(cls, v):
+        if not v:
+            raise ValueError("Required skills cannot be empty")
+        return v
+
 class Applicant(BaseModel):
     session_id : str
     name : str
@@ -41,10 +59,34 @@ class Applicant(BaseModel):
     education : str
     previous_roles : list
     location : str
-    language : str 
+    language : str
+
+    @validator("session_id")
+    def session_id_not_empty(cls, v):
+        if not v.strip():
+            raise ValueError("Session ID is missing")
+        return v
+    
+    @validator("skills")
+    def skills_not_empty(cls, v):
+        if not v:
+            raise ValueError("Skills cannot be empty")
+        return v
+    
+    @validator("name")
+    def name_not_empty(cls, v):
+        if not v.strip():
+            raise ValueError("Applicant name cannot be empty")
+        return v
 
 class ScreenRequest:
     session_id : str
+
+    @validator("session_id")
+    def session_id_not_empty(cls, v):
+        if not v.strip():
+            raise ValueError("Session ID is missing")
+        return v
 
 applicants_database = [
     {
