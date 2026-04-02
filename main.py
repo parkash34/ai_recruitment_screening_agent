@@ -5,6 +5,7 @@ import logging
 from pydantic import BaseModel, validator
 from dotenv import load_dotenv
 from fastapi import FastAPI
+import time
 
 
 logging.basicConfig(
@@ -314,6 +315,7 @@ def check_output_guardrail(response):
 
 
 def analyze_applicant(applicant_name):
+    time.sleep(3)
     global current_session
     session = sessions[current_session]
     job = session["job"]
@@ -526,7 +528,7 @@ def screen(request: ScreenRequest):
                     "tools": tools,
                     "tool_choice": "auto"
                 },
-                timeout=30
+                timeout=60
             )
             response.raise_for_status()
             message = response.json()["choices"][0]["message"]
@@ -553,6 +555,7 @@ def screen(request: ScreenRequest):
                 "tool_call_id": tool_call["id"],
                 "content": str(result)
             })
+            time.sleep(2)
 
         return {
             "status": "success",
@@ -566,6 +569,7 @@ def screen(request: ScreenRequest):
             message="Screening timed out.",
             details="Please try again."
         )
+    
     except requests.exceptions.HTTPError as e:
         logger.error(f"HTTP Error: {e.response.status_code}")
         return create_error_response(
@@ -573,6 +577,7 @@ def screen(request: ScreenRequest):
             message="AI service error.",
             details=f"Status: {e.response.status_code}"
         )
+    
     except Exception as e:
         logger.error(f"Screening error: {str(e)}")
         return create_error_response(
