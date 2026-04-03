@@ -299,6 +299,7 @@ def create_error_response(code, message, details=None):
         "message" : message,
         "details" : details
     }
+
 def check_output_guardrail(response):
     text = " ".join([
         response.get("recommendation", ""),
